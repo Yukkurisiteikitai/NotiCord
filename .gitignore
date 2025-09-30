@@ -1,0 +1,12 @@
+# Environments
+.env
+
+# Google Drive Credentials
+credentials.json
+
+# Python
+__pycache__/
+*.pyc
+.venv
+virtualenv/
+venv/
