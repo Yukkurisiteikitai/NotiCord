@@ -23,7 +23,7 @@ async def main():
 
     # Discord Botの起動
     # client.start()は非同期にBotを起動する
-    await discord_handler.client.start(discord_handler.DISCORD_BOT_TOKEN)
+    await discord_handler.bot.start(discord_handler.DISCORD_BOT_TOKEN)
 
 if __name__ == "__main__":
     print("アプリケーションを起動します...")
