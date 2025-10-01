@@ -298,7 +298,7 @@ async def upload_to_drive(attachment: discord.Attachment) -> str:
 - [Discord.py公式ドキュメント](https://discordpy.readthedocs.io/)
 - [Notion API公式ドキュメント](https://developers.notion.com/)
 - [Google Drive API Python Quickstart](https://developers.google.com/drive/api/quickstart/python)
-
+- [MyProjectknowledge](./knowledge/*)
 ---
 
 このプロンプトに基づいて、スケーラブルで堅牢なDiscord-Notion連携システムを構築できます。実装時は段階的に機能を追加し、各ステップでテストを行うことを推奨します。

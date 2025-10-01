@@ -3,6 +3,8 @@
 
 # Google Drive Credentials
 credentials.json
+client_secrets.json
+token.json
 
 # Python
 __pycache__/
