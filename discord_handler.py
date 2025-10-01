@@ -1,11 +1,14 @@
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import discord
 from discord.ext import commands
+import discord.app_commands
 
 import google_drive_handler
 import notion_handler
+import AI_handler
 from utils import split_message
 
 # 環境変数から設定を取得
@@ -50,12 +53,10 @@ async def sync_command(interaction: discord.Interaction):
         if result["status"] == "SUCCESS":
             summary = result.get("summary", [])
             if not summary:
-                # 処理は成功したが、対象が0件だった場合（フィルタリング後）
                 await interaction.followup.send("同期対象となる新しいメッセージはありませんでした。")
                 return
 
             message_lines = ["同期成功です。"]
-            # 概要の最初の3件を表示
             message_lines.extend(f"- {s}" for s in summary[:3])
             if len(summary) > 3:
                 message_lines.append(f"...他{len(summary) - 3}件の処理を行いました。")
@@ -66,16 +67,58 @@ async def sync_command(interaction: discord.Interaction):
 
         elif result["status"] == "ERROR":
             error_msg = result.get("error_message", "不明なエラー")
-            await interaction.followup.send(f"同期エラーが発生しました:\n```{error_msg}```")
+            await interaction.followup.send(f"同期エラーが発生しました:\n`{error_msg}`")
 
     except Exception as e:
         print(f"sync_commandで予期せぬエラーが発生しました: {e}")
-        await interaction.followup.send(f"予期せぬ重大なエラーが発生しました:\n```{e}```")
+        await interaction.followup.send(f"予期せぬ重大なエラーが発生しました:\n`{e}`")
+
+
+@bot.tree.command(name="summarize", description="指定したNotionページの議論をAIが要約します。")
+@discord.app_commands.describe(url="要約したいNotionページのURL")
+async def summarize_command(interaction: discord.Interaction, url: str):
+    """/summarizeコマンドの実装"""
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(f"要約処理を開始します...これには数分かかる場合があります。")
+
+    # 1. URLからNotionのページIDを抽出
+    match = re.search(r'([a-f0-9]{32})$', url.split('?')[0])
+    if not match:
+        await interaction.edit_original_response(content="無効なNotionページURLです。URLの末尾が32文字のIDであることを確認してください。")
+        return
+    page_id = match.group(1)
+
+    try:
+        # 2. Notionからページの全テキストを取得
+        print(f"Notionページ ({page_id}) からテキストを取得中...")
+        text_content = notion_handler.get_all_text_from_page(page_id)
+        if not text_content:
+            await interaction.edit_original_response(content=f"ページにテキストが見つかりませんでした。 (ID: {page_id})")
+            return
+
+        # 3. AIハンドラに要約を依頼
+        print("AIに要約を依頼中...")
+        summary = AI_handler.generate_knowledge_from_text(text_content)
+        if not summary:
+            await interaction.edit_original_response(content="AIによる要約の生成に失敗しました。LM-Studioのログを確認してください。")
+            return
+
+        # 4. 要約をNotionページに追記
+        print("要約をNotionページに書き込み中...")
+        notion_handler.add_summary_to_page(page_id, summary)
+
+        # 5. 完了を通知
+        await interaction.edit_original_response(content=f"要約が完了しました！\nNotionページに結果を追記しましたので、ご確認ください。\n{url}")
+
+    except Exception as e:
+        print(f"要約処理中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
+        await interaction.edit_original_response(content=f"要約処理中にエラーが発生しました。詳細はBotのログを確認してください。\n`{e}`")
 
 
 # --- 同期ロジック ---
 async def get_today_messages(channel):
-    # ... (この関数は変更なし) ...
     jst = timezone(timedelta(hours=+9), 'JST')
     today = datetime.now(jst).date()
     start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=jst)
@@ -121,7 +164,7 @@ async def sync_messages() -> dict:
         unprocessed_messages = [m for m in messages if str(m.id) not in processed_message_ids]
         print(f"{len(unprocessed_messages)}件の未処理メッセージを処理します。")
         if not unprocessed_messages:
-            return {"status": "SUCCESS", "summary": []} # 処理は成功したが対象が0件
+            return {"status": "SUCCESS", "summary": []}
 
         for message in unprocessed_messages:
             if not isinstance(message.channel, discord.Thread):
@@ -172,14 +215,12 @@ async def sync_messages() -> dict:
 
     except Exception as e:
         print(f"sync_messagesでエラーが発生しました: {e}")
-        # エラーの詳細をスタックトレースでコンソールに出力
         import traceback
         traceback.print_exc()
         return {"status": "ERROR", "error_message": str(e)}
 
 
 async def send_message_to_discord(content: str):
-    # ... (この関数は変更なし) ...
     channel = bot.get_channel(IDEA_CHANNEL_ID)
     if not channel:
         print(f"エラー: アイデアチャンネルが見つかりません: {IDEA_CHANNEL_ID}")

@@ -1,6 +1,6 @@
 
 import os
-from typing import Set
+from typing import Set, List, Dict, Any
 
 from notion_client import Client
 
@@ -14,8 +14,91 @@ DONE_MESSAGES_DATABASE_ID = os.getenv("DONE_MESSAGES_DATABASE_ID")
 notion = Client(auth=NOTION_API_KEY)
 
 
+def _get_text_from_rich_text(rich_text: List[Dict[str, Any]]) -> str:
+    """リッチテキストオブジェクトから結合されたテキストを抽出する"""
+    return "".join([t.get("plain_text", "") for t in rich_text])
+
+
+def _get_all_blocks_recursive(block_id: str) -> List[Dict[str, Any]]:
+    """指定されたブロックIDの子ブロックを再帰的にすべて取得する"""
+    all_blocks = []
+    has_more = True
+    start_cursor = None
+    while has_more:
+        response = notion.blocks.children.list(
+            block_id=block_id, start_cursor=start_cursor, page_size=100
+        )
+        blocks = response.get("results", [])
+        all_blocks.extend(blocks)
+        has_more = response.get("has_more", False)
+        start_cursor = response.get("next_cursor")
+
+    for block in all_blocks:
+        if block.get("has_children"):
+            block["children"] = _get_all_blocks_recursive(block["id"])
+
+    return all_blocks
+
+
+def get_all_text_from_page(page_id: str) -> str:
+    """ページの全ブロックからテキストを抽出し、一つの文字列として結合して返す"""
+    try:
+        all_blocks = _get_all_blocks_recursive(page_id)
+        text_parts = []
+
+        def extract_text(blocks: List[Dict[str, Any]]):
+            for block in blocks:
+                block_type = block.get("type")
+                if block_type in ["paragraph", "heading_1", "heading_2", "heading_3", "bulleted_list_item", "numbered_list_item", "quote", "callout", "toggle"]:
+                    text_parts.append(_get_text_from_rich_text(block[block_type]["rich_text"]))
+                
+                if block.get("has_children"):
+                    extract_text(block.get("children", []))
+
+        extract_text(all_blocks)
+        print(f"ページID {page_id} からテキストの抽出が完了しました。")
+        return "\n".join(text_parts)
+    except Exception as e:
+        print(f"ページ {page_id} からのテキスト抽出中にエラー: {e}")
+        return ""
+
+
+def add_summary_to_page(page_id: str, summary_text: str):
+    """指定されたページの末尾に、AIによる要約を見出し付きで追記する"""
+    try:
+        # 2000文字ごとにチャンクに分割（Notionのブロック上限を考慮）
+        chunks = [summary_text[i:i + 2000] for i in range(0, len(summary_text), 2000)]
+        quote_blocks = [{"object": "block", "type": "quote", "quote": {"rich_text": [{"type": "text", "text": {"content": chunk}}]}} for chunk in chunks]
+
+        blocks_to_append = [
+            {
+                "object": "block", 
+                "type": "divider", 
+                "divider": {}
+            },
+            {
+                "object": "block",
+                "type": "heading_2",
+                "heading_2": {
+                        "rich_text": [
+                            {
+                                "type": "text", 
+                                "text": {
+                                    "content": "🤖 AIによる要約"
+                                }
+                            }
+                        ]
+                    }
+            },
+            *quote_blocks
+        ]
+        notion.blocks.children.append(block_id=page_id, children=blocks_to_append)
+        print(f"ページ {page_id} にAIによる要約を追記しました。")
+    except Exception as e:
+        print(f"ページ {page_id} への要約追記中にエラー: {e}")
+
+
 def query_done_message_ids() -> Set[str]:
-    """DoneMessagesテーブルから処理済みの全メッセージIDを取得してセットで返す"""
     processed_ids = set()
     has_more = True
     start_cursor = None
@@ -23,7 +106,7 @@ def query_done_message_ids() -> Set[str]:
         response = notion.databases.query(
             database_id=DONE_MESSAGES_DATABASE_ID,
             start_cursor=start_cursor,
-            page_size=100, # 1回のAPIコールで最大100件取得
+            page_size=100,
         )
         for page in response.get("results", []):
             title_list = page.get("properties", {}).get("メッセージID", {}).get("title", [])
@@ -36,9 +119,7 @@ def query_done_message_ids() -> Set[str]:
     print(f"Notionから{len(processed_ids)}件の処理済みメッセージIDを取得しました。")
     return processed_ids
 
-
 def query_form_page_by_thread_id(thread_id: str) -> str | None:
-    """スレッドIDを使ってFormテーブルを検索し、ページIDを返す"""
     try:
         response = notion.databases.query(
             database_id=FORM_DATABASE_ID,
@@ -52,11 +133,9 @@ def query_form_page_by_thread_id(thread_id: str) -> str | None:
         print(f"スレッドIDでのページ検索中にエラー: {e}")
         return None
 
-
 def create_form_page(
     thread_name: str, thread_id: str, first_message_content: str, post_date: str, author_name: str
 ) -> str | None:
-    """Formテーブルに新しいページを作成し、ページIDを返す"""
     try:
         properties = {
             "名前": {"title": [{"text": {"content": thread_name}}]},
@@ -68,7 +147,8 @@ def create_form_page(
             {
                 "object": "block",
                 "type": "paragraph",
-                "paragraph": {"rich_text": [{"type": "text", "text": {"content": first_message_content}}]}
+                "paragraph": {"rich_text": [{"type": "text", "text": {"content": first_message_content}}]
+                              }
             }
         ]
         response = notion.pages.create(
@@ -81,9 +161,7 @@ def create_form_page(
         print(f"Formページの新規作成中にエラー: {e}")
         return None
 
-
 def append_text_to_page(page_id: str, content: str, author_name: str, post_time: str):
-    """指定されたページに新しいテキストブロックを追記する"""
     try:
         header_text = f"--- {post_time} | {author_name} ---"
         blocks = [
@@ -91,22 +169,23 @@ def append_text_to_page(page_id: str, content: str, author_name: str, post_time:
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": header_text}}]}
-            },
+            }
+            ,
             {
                 "object": "block",
                 "type": "paragraph",
                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": content}}]}
             }
+            
         ]
         notion.blocks.children.append(block_id=page_id, children=blocks)
     except Exception as e:
         print(f"ページ {page_id} へのブロック追記中にエラー: {e}")
 
 def add_done_message(message_id: str, form_page_id: str):
-    """DoneMessagesテーブルに処理済みメッセージを記録する"""
     try:
         properties = {
-            "メッセージID": {"title": [{"text": {"content": message_id}}]},
+            "メッセージID": {"title": [{"text": {"content": message_id}}],},
             "関連スレッド": {"relation": [{"id": form_page_id}]}
         }
         notion.pages.create(
@@ -119,10 +198,9 @@ def add_done_message(message_id: str, form_page_id: str):
 def create_asset_page(
     file_name: str, file_url: str, file_type: str, file_size: int, post_date: str
 ) -> str | None:
-    """Assetsテーブルに新規ページを作成し、ページIDを返す"""
     try:
         properties = {
-            "ファイル名": {"title": [{"text": {"content": file_name}}]},
+            "ファイル名": {"title": [{"text": {"content": file_name}}],},
             "ファイルURL": {"url": file_url},
             "ファイル種別": {"select": {"name": file_type}},
             "ファイルサイズ": {"number": file_size},
@@ -138,7 +216,6 @@ def create_asset_page(
         return None
 
 def relate_asset_to_form(form_page_id: str, asset_page_ids: list):
-    """FormページとAssetページをリレーションで紐付ける"""
     if not asset_page_ids:
         return
     try:
