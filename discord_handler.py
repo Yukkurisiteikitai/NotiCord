@@ -1,19 +1,18 @@
 import os
 from datetime import datetime, timedelta, timezone
-import re
 
 import discord
 from discord.ext import commands
 
 import google_drive_handler
 import notion_handler
-from utils import split_message, get_completion
+from utils import split_message
 
 # 環境変数から設定を取得
 DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 TARGET_CHANNEL_ID = int(os.getenv("TARGET_CHANNEL_ID"))
 IDEA_CHANNEL_ID = int(os.getenv("IDEA_CHANNEL_ID"))
-GUILD_ID = os.getenv("GUILD_ID") # 即時反映させたいサーバーID(任意)
+GUILD_ID = os.getenv("GUILD_ID")  # 即時反映させたいサーバーID(任意)
 
 # Intents設定
 intents = discord.Intents.default()
@@ -23,12 +22,13 @@ intents.message_content = True
 # Botのインスタンスを作成
 bot = commands.Bot(command_prefix="/", intents=intents)
 
+
 # --- イベントリスナー ---
 @bot.event
 async def on_ready():
     """Botが起動したときのイベント"""
     print(f"{bot.user} としてログインしました")
-    
+
     # スラッシュコマンドを同期
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
@@ -38,179 +38,151 @@ async def on_ready():
         await bot.tree.sync()
         print("コマンドをグローバルに同期しました。")
 
+
 # --- スラッシュコマンド ---
 @bot.tree.command(name="sync", description="DiscordのメッセージをNotionに手動で同期します。")
 async def sync_command(interaction: discord.Interaction):
-    """/syncコマンドの実装"""
+    """/syncコマンドの実装。詳細な結果を返すように変更。"""
     await interaction.response.defer(ephemeral=True)
     try:
-        await sync_messages()
-        await interaction.followup.send("同期が完了しました。")
+        result = await sync_messages()
+
+        if result["status"] == "SUCCESS":
+            summary = result.get("summary", [])
+            if not summary:
+                # 処理は成功したが、対象が0件だった場合（フィルタリング後）
+                await interaction.followup.send("同期対象となる新しいメッセージはありませんでした。")
+                return
+
+            message_lines = ["同期成功です。"]
+            # 概要の最初の3件を表示
+            message_lines.extend(f"- {s}" for s in summary[:3])
+            if len(summary) > 3:
+                message_lines.append(f"...他{len(summary) - 3}件の処理を行いました。")
+            await interaction.followup.send("\n".join(message_lines))
+
+        elif result["status"] == "NO_NEW_MESSAGES":
+            await interaction.followup.send("全て同期済みです。")
+
+        elif result["status"] == "ERROR":
+            error_msg = result.get("error_message", "不明なエラー")
+            await interaction.followup.send(f"同期エラーが発生しました:\n```{error_msg}```")
+
     except Exception as e:
-        print(f"同期中にエラーが発生しました: {e}")
-        await interaction.followup.send(f"エラーが発生しました: {e}")
+        print(f"sync_commandで予期せぬエラーが発生しました: {e}")
+        await interaction.followup.send(f"予期せぬ重大なエラーが発生しました:\n```{e}```")
+
 
 # --- 同期ロジック ---
 async def get_today_messages(channel):
-    """指定されたチャンネルから今日のメッセージを取得する。フォーラムとテキストチャンネルに対応。"""
+    # ... (この関数は変更なし) ...
     jst = timezone(timedelta(hours=+9), 'JST')
     today = datetime.now(jst).date()
     start_of_day = datetime.combine(today, datetime.min.time(), tzinfo=jst)
-    
     messages = []
-
     async def fetch_and_filter(iterable):
-        """メッセージを取得し、Bot自身の投稿を除外するヘルパー関数"""
         async for message in iterable:
             if message.author != bot.user:
                 messages.append(message)
-
-    # チャンネルタイプを判定
     if isinstance(channel, discord.ForumChannel):
         print("LoadType: Forumチャンネルからメッセージを読み込んでいます...")
-        # アクティブなスレッドを処理
         for thread in channel.threads:
             await fetch_and_filter(thread.history(after=start_of_day, oldest_first=True))
-        
-        # アーカイブされたスレッドも確認
         async for thread in channel.archived_threads(limit=None):
-            if thread.last_message_id:
-                last_message_time = discord.utils.snowflake_time(thread.last_message_id).astimezone(jst)
-                if last_message_time >= start_of_day:
-                    await fetch_and_filter(thread.history(after=start_of_day, oldest_first=True))
-
+            if thread.last_message_id and discord.utils.snowflake_time(thread.last_message_id).astimezone(jst) >= start_of_day:
+                await fetch_and_filter(thread.history(after=start_of_day, oldest_first=True))
     elif hasattr(channel, 'history'):
         print("LoadType: Textチャンネルからメッセージを読み込んでいます...")
         await fetch_and_filter(channel.history(after=start_of_day, oldest_first=True))
-        
     else:
         print(f"エラー: チャンネル '{channel.name}' ({channel.type}) はメッセージ履歴をサポートしていません。")
         return []
-
-    # 収集した全メッセージを投稿日時でソート
     messages.sort(key=lambda m: m.created_at)
-    
     return messages
 
-def build_prompt(message_content: str, notion_pages: list) -> str:
-    """AIに投げるプロンプトを生成する（改良版）"""
-    pages_list_str = "\n".join([f"- ID: {page['id']}, Title: {page['title']}" for page in notion_pages])
-    prompt = f"""あなたは、与えられた情報を整理する専門家です。
-以下の[新しいメッセージ]の内容を読み、[既存のNotionページリスト]の中から最も関連性の高いページを一つだけ選んでください。
 
-# 指示
-- 関連するページがリストにある場合は、そのページのIDだけを回答してください。
-- 関連するページがリストにない場合は、必ず 'new' とだけ回答してください。
-- IDや'new'以外の、いかなる説明や前置きも絶対に含めないでください。
+async def sync_messages() -> dict:
+    """同期処理を行い、結果を辞書型で返す"""
+    try:
+        print("DiscordからNotionへのIDベース同期処理を開始します...")
+        summary_logs = []
 
-[新しいメッセージ]
-{message_content}
+        processed_message_ids = notion_handler.query_done_message_ids()
 
-[既存のNotionページリスト]
-{pages_list_str}
+        channel = bot.get_channel(TARGET_CHANNEL_ID)
+        if not channel:
+            return {"status": "ERROR", "error_message": f"チャンネルが見つかりません: {TARGET_CHANNEL_ID}"}
+        
+        messages = await get_today_messages(channel)
+        if not messages:
+            print("同期対象の新しいメッセージはありません。")
+            return {"status": "NO_NEW_MESSAGES"}
 
-回答:"""
-    return prompt
+        unprocessed_messages = [m for m in messages if str(m.id) not in processed_message_ids]
+        print(f"{len(unprocessed_messages)}件の未処理メッセージを処理します。")
+        if not unprocessed_messages:
+            return {"status": "SUCCESS", "summary": []} # 処理は成功したが対象が0件
 
-async def create_new_notion_page(message, post_date, post_time_str):
-    """Notionに新しいページを作成する処理をまとめた関数"""
-    title = f"{post_time_str} | {message.author.display_name}"
-    
-    asset_page_ids = []
-    if message.attachments:
-        print(f"    - 添付ファイルが{len(message.attachments)}件あります。")
-        for attachment in message.attachments:
-            try:
-                file_url = await google_drive_handler.upload_to_drive(attachment)
-                file_type = attachment.content_type.split('/')[0] if attachment.content_type else 'Unknown'
-                asset_id = notion_handler.create_asset_page(
-                    file_name=attachment.filename,
-                    file_url=file_url,
-                    file_type=file_type,
-                    file_size=attachment.size,
-                    post_date=post_date
+        for message in unprocessed_messages:
+            if not isinstance(message.channel, discord.Thread):
+                continue
+
+            thread_id = str(message.channel.id)
+            thread_name = message.channel.name
+            form_page_id = notion_handler.query_form_page_by_thread_id(thread_id)
+            jst_time = message.created_at.astimezone(timezone(timedelta(hours=+9), 'JST'))
+
+            if not form_page_id:
+                form_page_id = notion_handler.create_form_page(
+                    thread_name=thread_name, thread_id=thread_id,
+                    first_message_content=message.content, post_date=jst_time.isoformat(),
+                    author_name=message.author.display_name
                 )
-                asset_page_ids.append(asset_id)
-            except Exception as e:
-                print(f"    - 添付ファイルのアップロード中にエラー: {e}")
-
-    notion_handler.create_form_page(
-        title=title,
-        message_content=message.content,
-        post_date=post_date,
-        author_name=message.author.display_name,
-        asset_page_ids=asset_page_ids
-    )
-
-async def sync_messages():
-    """Discord → Notionへの同期を実行するメインロジック（AI判断・検証機能あり）"""
-    print("DiscordからNotionへのAI同期処理を開始します...")
-    channel = bot.get_channel(TARGET_CHANNEL_ID)
-    if not channel:
-        print(f"エラー: チャンネルが見つかりません: {TARGET_CHANNEL_ID}")
-        return
-
-    messages = await get_today_messages(channel)
-    if not messages:
-        print("同期対象の新しいメッセージはありません。")
-        return
-
-    print(f"{len(messages)}件の新規メッセージを処理します。")
-    
-    # Notionの既存ページリストを取得
-    notion_pages = notion_handler.query_form_database()
-    print(f"Notionから{len(notion_pages)}件の既存ページを取得しました。")
-    # 検証のために、IDのセットを作成
-    existing_page_ids = {p['id'] for p in notion_pages}
-
-    for message in messages:
-        jst_time = message.created_at.astimezone(timezone(timedelta(hours=+9), 'JST'))
-        post_date = jst_time.isoformat()
-        post_time_str = jst_time.strftime('%H:%M')
-
-        # AIに関連ページを問い合わせ
-        prompt = build_prompt(message.content, notion_pages)
-        ai_response = get_completion(prompt)
-        
-        print(f"  - AI raw response: {ai_response}")
-
-        if not ai_response:
-            print(f"  - メッセージID {message.id} のAI判断を取得できませんでした。スキップします。")
-            continue
-
-        # 回答からページIDらしきものを抽出
-        page_id_match = re.search(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', ai_response)
-        
-        page_to_update = None
-        if page_id_match:
-            potential_id = page_id_match.group(1)
-            # ★★★ AIの回答を検証 ★★★
-            if potential_id in existing_page_ids:
-                page_to_update = potential_id
+                if not form_page_id:
+                    summary_logs.append(f"スレッド「{thread_name}」のページ作成に失敗しました。")
+                    continue
+                summary_logs.append(f"スレッド「{thread_name}」を新規作成し、メッセージを追加しました。")
             else:
-                print(f"  - AIの判断は幻覚でした (存在しないID: {potential_id})。新規ページを作成します。")
+                notion_handler.append_text_to_page(
+                    page_id=form_page_id, content=message.content,
+                    author_name=message.author.display_name, post_time=jst_time.strftime('%H:%M')
+                )
+                summary_logs.append(f"スレッド「{thread_name}」に{message.author.display_name}のメッセージを追加しました。")
 
-        if page_to_update:
-            print(f"  - AIの判断: 既存ページに追記 (ID: {page_to_update})")
-            notion_handler.append_block_to_page(
-                page_id=page_to_update,
-                content=message.content,
-                author_name=message.author.display_name,
-                post_time=post_time_str
-            )
-        else:
-            if not page_id_match:
-                 print(f"  - AIの判断: 新規ページ作成 (AIの応答: '{ai_response.strip()}')")
-            await create_new_notion_page(message, post_date, post_time_str)
+            if message.attachments:
+                asset_page_ids = []
+                for attachment in message.attachments:
+                    file_url = await google_drive_handler.upload_to_drive(attachment)
+                    if file_url:
+                        asset_id = notion_handler.create_asset_page(
+                            file_name=attachment.filename, file_url=file_url,
+                            file_type=attachment.content_type or 'Unknown',
+                            file_size=attachment.size, post_date=jst_time.isoformat()
+                        )
+                        if asset_id:
+                            asset_page_ids.append(asset_id)
+                if asset_page_ids:
+                    notion_handler.relate_asset_to_form(form_page_id, asset_page_ids)
+                    summary_logs[-1] += f"（添付ファイル{len(asset_page_ids)}件を含む）"
 
-    print("同期処理が完了しました。")
+            notion_handler.add_done_message(str(message.id), form_page_id)
+
+        print("同期処理が正常に完了しました。")
+        return {"status": "SUCCESS", "summary": summary_logs}
+
+    except Exception as e:
+        print(f"sync_messagesでエラーが発生しました: {e}")
+        # エラーの詳細をスタックトレースでコンソールに出力
+        import traceback
+        traceback.print_exc()
+        return {"status": "ERROR", "error_message": str(e)}
+
 
 async def send_message_to_discord(content: str):
-    """Notion → Discordへの同期を実行するロジック"""
+    # ... (この関数は変更なし) ...
     channel = bot.get_channel(IDEA_CHANNEL_ID)
     if not channel:
         print(f"エラー: アイデアチャンネルが見つかりません: {IDEA_CHANNEL_ID}")
         return
-        
     for chunk in split_message(content):
         await channel.send(chunk)
