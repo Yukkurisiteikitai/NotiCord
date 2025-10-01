@@ -1,6 +1,4 @@
-from typing import List
-
-def split_message(text: str, max_length: int = 2000) -> List[str]:
+def split_message(text: str, max_length: int = 2000) -> list[str]:
     """長文を指定文字数で分割（単語境界を考慮）"""
     if len(text) <= max_length:
         return [text]

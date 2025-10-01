@@ -3,6 +3,8 @@
 
 # Google Drive Credentials
 credentials.json
+client_secrets.json
+token.json
 
 # Python
 __pycache__/
@@ -10,3 +12,6 @@ __pycache__/
 .venv
 virtualenv/
 venv/
+
+# Normal
+.DS_Store
